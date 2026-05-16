@@ -5,9 +5,19 @@ frappe.pages['doctype-creator'].on_page_load = function(wrapper) {
         single_column: true
     });
 
-    // Global state for the session
-    wrapper.sheet_data = {};     // Holds all headers { "Sheet1": [cols], ... }
-    wrapper.sheet_mappings = {}; // Holds confirmed mappings { "Sheet1": {map}, ... }
+    wrapper.sheet_data = {};
+    wrapper.sheet_mappings = {};
+    wrapper.frappe_modules = ['Custom']; // Fallback
+
+    // NEW: Fetch all Frappe Modules in the background as soon as the page loads
+    frappe.call({
+        method: 'doctype_creator.api.get_active_modules',
+        callback: function(r) {
+            if(r.message) {
+                wrapper.frappe_modules = r.message;
+            }
+        }
+    });
 
     page.set_primary_action('Upload Excel/CSV', () => {
         new frappe.ui.FileUploader({
@@ -50,20 +60,12 @@ function render_dashboard(wrapper) {
     let container = $(wrapper).find('#creator-container');
     container.empty();
 
-    // SAFETY CHECK: Did we actually get data?
     if (!wrapper.sheet_data || Object.keys(wrapper.sheet_data).length === 0) {
-        container.html(`
-            <div class="alert alert-danger mt-4">
-                <strong>Upload Failed:</strong> The backend could not read any sheets from this file. 
-                Please ensure it is a valid CSV or Excel file.
-            </div>
-        `);
+        container.html(`<div class="alert alert-danger mt-4">Upload Failed: The backend could not read any sheets.</div>`);
         return;
     }
 
     let sheet_names = Object.keys(wrapper.sheet_data);
-    
-    // SAFE ID GENERATOR: Replaces spaces and special chars with underscores
     let safe_id = (name) => name.replace(/[^a-zA-Z0-9]/g, '_');
     
     let html = `
@@ -76,17 +78,20 @@ function render_dashboard(wrapper) {
                     <ul class="list-group list-group-flush" id="sheet-list">
                         ${sheet_names.map(name => `
                             <li class="list-group-item d-flex justify-content-between align-items-center sheet-item" style="cursor:pointer;" data-sheet="${name}">
-                                <div>
-                                    <input type="checkbox" class="sheet-checkbox mr-2" value="${name}">
-                                    <strong>${name}</strong>
-                                </div>
+                                <div><input type="checkbox" class="sheet-checkbox mr-2" value="${name}"><strong>${name}</strong></div>
                                 <span class="badge badge-warning sheet-status" id="badge-${safe_id(name)}">Pending</span>
                             </li>
                         `).join('')}
                     </ul>
                     <div class="card-footer">
                         <div class="checkbox mb-2">
-                            <label><input type="checkbox" id="auto-create-dt"> Auto-Create Missing DocTypes</label>
+                            <label><input type="checkbox" id="auto-create-dt"> <b>Auto-Create Missing DocTypes</b></label>
+                        </div>
+                        <div id="module-wrapper" style="display: none; margin-bottom: 15px;">
+                            <label style="font-size: 12px; color: #555;">Select Target Module</label>
+                            <select id="target-module" class="form-control form-control-sm">
+                                ${wrapper.frappe_modules.map(m => `<option value="${m}" ${m === 'Custom' ? 'selected' : ''}>${m}</option>`).join('')}
+                            </select>
                         </div>
                         <button id="process-batch-btn" class="btn btn-primary btn-block">Inject Selected Sheets</button>
                     </div>
@@ -111,23 +116,25 @@ function render_dashboard(wrapper) {
     `;
     container.html(html);
 
-    // Sidebar Clicks
-    container.find('.sheet-item').on('click', function(e) {
-        if(e.target.type === "checkbox") return; 
-        
-        container.find('.sheet-item').removeClass('bg-light border-primary');
-        $(this).addClass('bg-light border-primary');
-        
-        let sheet_name = $(this).data('sheet');
-        render_mapper_workspace(sheet_name, wrapper, container);
+    // Toggle Module Input visibility when checkbox is clicked
+    container.find('#auto-create-dt').on('change', function() {
+        if($(this).is(':checked')) {
+            container.find('#module-wrapper').slideDown(200);
+        } else {
+            container.find('#module-wrapper').slideUp(200);
+        }
     });
 
-    // Batch Process
+    container.find('.sheet-item').on('click', function(e) {
+        if(e.target.type === "checkbox") return; 
+        container.find('.sheet-item').removeClass('bg-light border-primary');
+        $(this).addClass('bg-light border-primary');
+        render_mapper_workspace($(this).data('sheet'), wrapper, container);
+    });
+
     container.find('#process-batch-btn').on('click', () => {
         let selected_sheets = [];
-        container.find('.sheet-checkbox:checked').each(function() {
-            selected_sheets.push($(this).val());
-        });
+        container.find('.sheet-checkbox:checked').each(function() { selected_sheets.push($(this).val()); });
 
         if(selected_sheets.length === 0) {
             frappe.msgprint("Please select at least one sheet using the checkboxes.");
@@ -138,23 +145,23 @@ function render_dashboard(wrapper) {
         let missing_confirmations = [];
 
         selected_sheets.forEach(sheet => {
-            if(wrapper.sheet_mappings[sheet]) {
-                batch_mappings[sheet] = wrapper.sheet_mappings[sheet];
-            } else {
-                missing_confirmations.push(sheet);
-            }
+            if(wrapper.sheet_mappings[sheet]) batch_mappings[sheet] = wrapper.sheet_mappings[sheet];
+            else missing_confirmations.push(sheet);
         });
 
         if(missing_confirmations.length > 0) {
-            frappe.msgprint(`You selected sheets that haven't been mapped and confirmed yet: <b>${missing_confirmations.join(', ')}</b>. Please confirm them first.`);
+            frappe.msgprint(`Unconfirmed sheets selected: <b>${missing_confirmations.join(', ')}</b>. Confirm them first.`);
             return;
         }
 
+        // GRAB THE MODULE VALUE
         let auto_create = container.find('#auto-create-dt').is(':checked') ? 1 : 0;
-        execute_batch_injection(wrapper.file_url, batch_mappings, auto_create);
+        let target_module = container.find('#target-module').val() || "Custom";
+        
+        execute_batch_injection(wrapper.file_url, batch_mappings, auto_create, target_module);
     });
 
-    // Export/Import JSON
+    // Import/Export Logic
     container.find('#export-btn').on('click', () => {
         let dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(wrapper.sheet_mappings));
         let a = document.createElement('a'); a.href = dataStr; a.download = "mapping_profile.json"; a.click();
@@ -163,8 +170,7 @@ function render_dashboard(wrapper) {
     container.find('#import-btn').on('click', () => {
         let input = document.createElement('input'); input.type = 'file'; input.accept = 'application/json';
         input.onchange = e => {
-            let reader = new FileReader();
-            reader.readAsText(e.target.files[0], 'UTF-8');
+            let reader = new FileReader(); reader.readAsText(e.target.files[0], 'UTF-8');
             reader.onload = re => {
                 wrapper.sheet_mappings = JSON.parse(re.target.result);
                 Object.keys(wrapper.sheet_mappings).forEach(s => {
@@ -187,28 +193,46 @@ function render_mapper_workspace(sheet_name, wrapper, main_container) {
     let saved_mapping = wrapper.sheet_mappings[sheet_name] || {};
 
     let html = `<table class="table table-bordered">
-                <thead><tr class="bg-light"><th>Frappe Property</th><th>Excel Column</th></tr></thead>
+                <thead>
+                    <tr class="bg-light">
+                        <th style="width: 50%;">Excel Column (Source)</th>
+                        <th style="width: 50%;">Frappe Property (Target)</th>
+                    </tr>
+                </thead>
                 <tbody id="mapping-body">`;
 
-    const required_props = [
-        { id: "target_doctype", label: "Target DocType" },
+    const frappe_props = [
+        { id: "target_doctype", label: "Target DocType (Required)" },
         { id: "label", label: "Field Label" },
-        { id: "fieldname", label: "Field Name (slug)" },
+        { id: "fieldname", label: "Field Name (slug) (Required)" },
         { id: "fieldtype", label: "Field Type" },
+        { id: "options", label: "Options (For Link/Select)" },
         { id: "reqd", label: "Mandatory (Yes/No)" },
-        { id: "description", label: "Description" }
+        { id: "default", label: "Default Value" },
+        { id: "description", label: "Description" },
+        { id: "hidden", label: "Hidden (Yes/No)" },
+        { id: "read_only", label: "Read Only (Yes/No)" },
+        { id: "depends_on", label: "Depends On (Logic)" },
+        { id: "in_list_view", label: "In List View (Yes/No)" }
     ];
 
-    required_props.forEach(prop => {
-        let options = `<option value="">-- Ignore / Set Manually --</option>`;
-        headers.forEach(header => {
-            let is_match = saved_mapping[prop.id] === header || (!saved_mapping[prop.id] && (header.toLowerCase().includes(prop.id.split('_')[0]) || prop.label.toLowerCase().includes(header.toLowerCase())));
-            options += `<option value="${header}" ${is_match ? 'selected' : ''}>${header}</option>`;
+    headers.forEach(header => {
+        let options = `<option value="">-- Ignore / Do Not Map --</option>`;
+
+        frappe_props.forEach(prop => {
+            // Check if this property was previously saved to this specific header
+            let is_saved_match = saved_mapping[prop.id] === header;
+
+            // Smart auto-guess if no saved mapping exists yet
+            let is_auto_match = !saved_mapping[prop.id] && (header.toLowerCase().includes(prop.id.split('_')[0]) || prop.label.toLowerCase().includes(header.toLowerCase()));
+
+            let selected = (is_saved_match || is_auto_match) ? 'selected' : '';
+            options += `<option value="${prop.id}" ${selected}>${prop.label}</option>`;
         });
 
-        html += `<tr class="mapping-row" data-prop="${prop.id}">
-                    <td><strong>${prop.label}</strong></td>
-                    <td><select class="form-control column-select">${options}</select></td>
+        html += `<tr class="mapping-row" data-header="${header}">
+                    <td><strong>${header}</strong></td>
+                    <td><select class="form-control prop-select">${options}</select></td>
                  </tr>`;
     });
 
@@ -221,45 +245,103 @@ function render_mapper_workspace(sheet_name, wrapper, main_container) {
 
     ws.find('#confirm-sheet-btn').on('click', () => {
         let mapping = {};
+        let assigned_props = [];
+        let duplicate_error = false;
+
         ws.find('.mapping-row').each(function() {
-            let val = $(this).find('.column-select').val();
-            if(val) mapping[$(this).data('prop')] = val;
+            let excel_col = $(this).data('header');
+            let selected_prop = $(this).find('.prop-select').val();
+
+            if(selected_prop) {
+                // BUG PREVENTION: Check if we already mapped this Frappe Property
+                if(assigned_props.includes(selected_prop)) {
+                    let prop_label = frappe_props.find(p => p.id === selected_prop).label;
+                    frappe.msgprint(`<b>Duplicate Mapping Error:</b> You have mapped "<b>${prop_label}</b>" to multiple columns. Each target property can only be used once per sheet.`);
+                    duplicate_error = true;
+                    return false; // This breaks out of the jQuery .each() loop
+                }
+                
+                assigned_props.push(selected_prop);
+                mapping[selected_prop] = excel_col;
+            }
         });
 
+        // Stop execution if duplicates were found
+        if(duplicate_error) return;
+
+        // Check for mandatory fields
         if(!mapping['target_doctype'] || !mapping['fieldname']) {
-            frappe.msgprint("Target DocType and Field Name mappings are required before saving.");
+            frappe.msgprint("<b>Target DocType</b> and <b>Field Name</b> mappings are strictly required before saving.");
             return;
         }
 
         // Save to global state
         wrapper.sheet_mappings[sheet_name] = mapping;
         
+        let safe_id = sheet_name.replace(/[^a-zA-Z0-9]/g, '_');
+        
         // Visual updates
         frappe.show_alert({message: `${sheet_name} mapping saved!`, indicator: 'green'});
-        let valid_id = frappe.utils.make_valid_name(sheet_name);
-        main_container.find(`#badge-${valid_id}`).removeClass('badge-warning').addClass('badge-success').text('Confirmed ✅');
-        main_container.find(`.sheet-checkbox[value="${sheet_name}"]`).prop('checked', true); // Auto-check it for processing
+        main_container.find(`#badge-${safe_id}`).removeClass('badge-warning').addClass('badge-success').text('Confirmed ✅');
+        main_container.find(`.sheet-checkbox[value="${sheet_name}"]`).prop('checked', true); 
     });
 }
 
-function execute_batch_injection(file_url, batch_mappings, auto_create) {
+function execute_batch_injection(file_url, batch_mappings, auto_create, target_module) {
     frappe.call({
         method: 'doctype_creator.api.process_batch_injection',
         args: { 
             file_url: file_url,
             batch_mappings: batch_mappings,
-            auto_create: auto_create
+            auto_create: auto_create,
+            target_module: target_module 
         },
         freeze: true,
-        freeze_message: "Processing Batch Injection...",
+        freeze_message: "Injecting Database Fields... (This may take a minute)",
         callback: function(r) {
             let res = r.message;
-            if (res && res.errors && res.errors.length > 0) {
-                console.error("Batch Errors:", res.errors);
-                frappe.msgprint({title: "Batch Completed with Errors", message: `Successfully injected ${res.fields_injected} fields, but encountered ${res.errors.length} errors. Please check the browser console for exact details.`});
-            } else if (res && res.status === 'success') {
-                frappe.show_alert({message: `Massive Success! Injected ${res.fields_injected} fields across all selected sheets.`, indicator: 'green'});
+            
+            if (res && res.excel_base64) {
+                // Instantly trigger Excel download
+                download_excel_report(res.excel_base64);
+                
+                let failed_count = res.errors ? res.errors.length : 0;
+                let success_count = res.fields_injected;
+
+                if (failed_count > 0) {
+                    frappe.msgprint({ 
+                        title: "Injection Completed with some Errors", 
+                        message: `Successfully injected <b>${success_count}</b> fields, but hit <b>${failed_count}</b> errors.<br><br><b>A detailed Excel report (.xlsx) has been downloaded automatically.</b> Check it to see exactly which fields failed and their Field Types.`, 
+                        indicator: 'orange' 
+                    });
+                } else {
+                    frappe.show_alert({message: `Massive Success! Injected ${success_count} fields cleanly. Excel report downloaded.`, indicator: 'green'});
+                }
+            } else {
+                frappe.msgprint("Something went wrong processing the response.");
             }
         }
     });
+}
+
+function download_excel_report(base64_data) {
+    // Decode Base64 string to Binary Array
+    const byteCharacters = atob(base64_data);
+    const byteNumbers = new Array(byteCharacters.length);
+    for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+    }
+    const byteArray = new Uint8Array(byteNumbers);
+    
+    // Create a Blob with the official Excel MIME type
+    const blob = new Blob([byteArray], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    
+    // Trigger download
+    let url = URL.createObjectURL(blob);
+    let link = document.createElement("a");
+    link.href = url;
+    link.download = "DocType_Injection_Report.xlsx";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
 }
